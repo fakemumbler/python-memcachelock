@@ -1,8 +1,13 @@
 import thread
 import threading
 import time
+import logging
+import uuid
+import functools
+
 
 LOCK_UID_KEY_SUFFIX = '_uid'
+
 
 class MemcacheLockError(Exception):
     """
@@ -12,6 +17,41 @@ class MemcacheLockError(Exception):
     evicted data we needed...).
     """
     pass
+
+
+class MemcacheLockCasError(MemcacheLockError):
+    pass
+
+
+class MemcacheLockGetsError(MemcacheLockError):
+    pass
+
+
+class MemcacheLockReleaseError(MemcacheLockError):
+    pass
+
+
+class MemcacheLockUidError(MemcacheLockError):
+    pass
+
+
+def _swallow_lockerrors(alternative_function):
+    """Utility decorator so that we continue 'locking' when memcache absent"""
+    def func_wrapper(func):
+        @functools.wraps(func)
+        def final_wrapper(self, *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except MemcacheLockError:
+                if self.logger:
+                    self.logger.warning('Memcache lock failure', exc_info=True)
+                if self.durable:
+                    return alternative_function()
+                else:
+                    raise
+        return final_wrapper
+    return func_wrapper
+
 
 class RLock(object):
     """
@@ -33,7 +73,8 @@ class RLock(object):
     """
     reentrant = True
 
-    def __init__(self, client, key, interval=0.05, uid=None, timeout=0):
+    def __init__(self, client, key, interval=0.05, uid=None, timeout=0,
+                 durable=False, log=False):
         """
         client (memcache.Client)
             Memcache connection. Must support cas
@@ -54,6 +95,15 @@ class RLock(object):
             WARNING: You must be very sure of what you do before fiddling with
             this parameter. Especially, don't mix up auto-allocated uid and
             provided uid on the same key. You have been warned.
+        timeout (int)
+            how long to set locks for
+        durable (bool)
+            don't throw Exceptions if memcache or our locks go away;
+            pretend you can acquire locks if memcache is not responsive.
+            This is probably useful with timeout.
+        log (bool)
+            send warnings to a logger (on losing memcache). Again, useful with
+            timeout/durable.
         """
         if getattr(client, 'cas', None) is None or getattr(client, 'gets',
                 None) is None:
@@ -66,23 +116,33 @@ class RLock(object):
         if key.endswith(LOCK_UID_KEY_SUFFIX):
             raise ValueError('Key conflicts with internal lock storage key '
                 '(ends with ' + LOCK_UID_KEY_SUFFIX + ')')
+
         self.memcache = client
         # Compute hash once only. Also used to keep lock uid close to the
         # value it manages.
         self.timeout = timeout
         key_hash = hash(key)
         self.key = (key_hash, key)
-        uid_key = (key_hash, key + LOCK_UID_KEY_SUFFIX)
-        client.check_key(uid_key[1])
-        if uid is None:
-            if client.gets(uid_key) is None:
-                # Nobody has used this lock yet (or it was lost in a server
-                # restart). Init to 0. Don't care if it fails, we just need a
-                # value to be set.
-                client.cas(uid_key, 0)
-            uid = client.incr(uid_key)
-        self.uid = uid
         self.interval = interval
+        self.logger = logging.getLogger(__name__) if log else None
+        self.durable = durable
+
+        self.uid = uid
+        if not self.uid:
+            self.uid = self._find_uid((key_hash, key + LOCK_UID_KEY_SUFFIX))
+
+    @_swallow_lockerrors(lambda: uuid.uuid3(uuid.NAMESPACE_DNS, __name__).bytes)
+    def _find_uid(self, uid_key):
+        self.memcache.check_key(uid_key[1])
+        if self.memcache.gets(uid_key) is None:
+            # Nobody has used this lock yet (or it was lost in a server
+            # restart). Init to 0. Don't care if it fails, we just need a
+            # value to be set.
+            self.memcache.cas(uid_key, 0)
+        res = self.memcache.incr(uid_key)
+        if res is None:
+            raise MemcacheLockUidError('incr failed to give number')
+        return res
 
     def __repr__(self):
         return '<%s(key=%r, interval=%r, uid=%r, timeout=%s) at 0x%x>' % (
@@ -94,6 +154,7 @@ class RLock(object):
             id(self),
         )
 
+    @_swallow_lockerrors(lambda: True)
     def acquire(self, blocking=True):
         while True:
             owner, count = self.__get()
@@ -107,7 +168,7 @@ class RLock(object):
                 # Nobody had it on __get call, try to acquire it.
                 try:
                     self.__set(1)
-                except MemcacheLockError:
+                except MemcacheLockCasError:
                     # Someting else was faster.
                     pass
                 else:
@@ -119,17 +180,21 @@ class RLock(object):
             time.sleep(self.interval)
         return False
 
+    @_swallow_lockerrors(lambda: None)
     def release(self):
         owner, count = self.__get()
         if owner != self.uid:
-            raise thread.error('release lock not owned by me')
+            raise MemcacheLockReleaseError(
+                '%s: should be owned by me (%s), but owned by %s'
+                % (self.key[1], self.uid, owner)
+            )
         assert count > 0
         self.__set(count - 1)
 
     def locked(self, by_self=False):
         """
         by_self (bool, False)
-            If True, returns wether this instance holds this lock.
+            If True, returns whether this instance holds this lock.
         """
         owner_uid = self.__get()[0]
         return by_self and owner_uid == self.uid or owner_uid is not None
@@ -161,14 +226,17 @@ class RLock(object):
             self.memcache.add(self.key, (None, 0))
             value = self.memcache.gets(self.key)
             if value is None:
-                raise MemcacheLockError('Memcached caught fire')
+                raise MemcacheLockGetsError('Memcache not storing anything')
         return value
 
     def __set(self, count):
-        if not self.memcache.cas(
+        cas_result = self.memcache.cas(
             self.key, (count and self.uid or None, count), self.timeout
-        ):
-            raise MemcacheLockError('Lock stolen')
+        )
+        if cas_result:
+            self.last_set_time = time.time()
+        else:
+            raise MemcacheLockCasError('Lock stolen')
 
 class Lock(RLock):
     reentrant = False

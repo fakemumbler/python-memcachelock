@@ -6,7 +6,11 @@ import time
 import multiprocessing
 
 import memcache
-from memcachelock import RLock, Lock, ThreadRLock, LOCK_UID_KEY_SUFFIX
+from memcachelock import (
+    RLock, Lock, ThreadRLock, LOCK_UID_KEY_SUFFIX,
+    MemcacheLockReleaseError, MemcacheLockCasError,
+    MemcacheLockUidError, MemcacheLockGetsError
+)
 
 import unittest
 
@@ -71,7 +75,7 @@ class TestBasicLogic(TestLock):
         self.assertFalse(locka2.acquire(False))
         self.check([locka1, locka2], unlocked=[lockb1])
 
-        self.assertRaises(thread.error, locka2.release)
+        self.assertRaises(MemcacheLockReleaseError, locka2.release)
         self.check([locka1, locka2], unlocked=[lockb1])
 
         self.assertEquals(locka2.getOwnerUid(), locka1.uid)
@@ -135,6 +139,97 @@ class TestBasicLogic(TestLock):
         self.assertFalse(self._test_reentrant_thread(ThreadRLock))
 
 
+class TestMemcacheNoCas(TestLock):
+    def test_nocas(self):
+        mc = memcache.Client(TEST_HOSTS)
+        self.assertRaises(TypeError, Lock, mc, TEST_KEY_1)
+
+
+class TestMemcacheGoesAway(TestLock):
+    """What happens when memcache is no longer around..."""
+    def setUp(self):
+        self.mc4 = memcache.Client(['127.0.0.1:11211'], cache_cas=True)
+
+    def _bring_down_mc4(self):
+        self.mc4.set_servers(['127.0.0.1:12345'])
+
+    def test_init_failure(self):
+        self._bring_down_mc4()
+        self.assertRaises(
+            MemcacheLockUidError, Lock,
+            self.mc4, TEST_KEY_1
+        )
+
+    def test_acquire_failure(self):
+        lock = Lock(self.mc4, TEST_KEY_1)
+        self._bring_down_mc4()
+        self.assertRaises(MemcacheLockGetsError, lock.acquire, False)
+
+    def test_release_away_failure(self):
+        lock = Lock(self.mc4, TEST_KEY_1)
+        self.assertTrue(lock.acquire(False))
+        self._bring_down_mc4()
+        self.assertRaises(
+            MemcacheLockGetsError, lock.release
+        )
+
+    def test_release_returned_failure(self):
+        lock = Lock(self.mc4, TEST_KEY_1)
+        self.assertTrue(lock.acquire(False))
+        # simulate the key going away
+        # (e.g. server reboot, timeout, eviction, ...)
+        self.mc4.delete(TEST_KEY_1)
+        self.assertRaises(
+            MemcacheLockReleaseError, lock.release
+        )
+
+
+class TestMemcacheDurable(TestLock):
+    """What happens when memcache is no longer around (but we don't care)"""
+    def setUp(self):
+        self.mc4 = memcache.Client(TEST_HOSTS, cache_cas=True)
+
+    def _bring_down_mc4(self):
+        self.mc4.set_servers(['127.0.0.1:12345'])
+
+    def _bring_up_mc4(self):
+        self.mc4.set_servers(TEST_HOSTS)
+
+    def test_init_failure(self):
+        self._bring_down_mc4()
+        locka = Lock(self.mc4, TEST_KEY_1, durable=True)
+        lockb = Lock(self.mc4, TEST_KEY_1, durable=True)
+        self.assertIsInstance(locka.uid, str)  # checking uuid used
+        self._bring_up_mc4()
+        self.assertTrue(locka.acquire(False))
+        self.assertFalse(lockb.acquire(False))
+        locka.release()
+        self.assertTrue(lockb.acquire(False))
+        lockb.release()
+
+    def test_acquire_failure(self):
+        locka = Lock(self.mc4, TEST_KEY_1, durable=True)
+        self._bring_down_mc4()
+        self.assertTrue(locka.acquire(False))
+        self._bring_up_mc4()
+        locka.release()
+
+    def test_release_away_failure(self):
+        lock = Lock(self.mc4, TEST_KEY_1, durable=True)
+        self.assertTrue(lock.acquire(False))
+        self._bring_down_mc4()
+        lock.release()
+
+    def test_release_returned_failure(self):
+        lock = Lock(self.mc4, TEST_KEY_1, durable=True)
+        self.assertTrue(lock.acquire(False))
+        # simulate the key going away
+        # (e.g. server reboot, timeout, eviction, ...)
+        self.mc4.delete(TEST_KEY_1)
+        lock.release()
+
+
+### multiprocessing helper
 def locker((LockType, key, sleep_time)):
     lock = LockType(memcache.Client(TEST_HOSTS, cache_cas=True), key)
     lock.acquire()
