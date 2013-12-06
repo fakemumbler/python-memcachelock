@@ -33,10 +33,11 @@ class RLock(object):
     """
     reentrant = True
 
-    def __init__(self, client, key, interval=0.05, uid=None):
+    def __init__(self, client, key, interval=0.05, uid=None, timeout=0):
         """
         client (memcache.Client)
-            Memcache connection.
+            Memcache connection. Must support cas
+            (by default, python-memcached DOES NOT unless you set cache_cas)
         key (str)
             Unique identifier for protected resource, common to all locks
             protecting this resource.
@@ -58,12 +59,17 @@ class RLock(object):
                 None) is None:
             raise TypeError('Client does not implement "gets" and/or "cas" '
                 'methods.')
+
+        if hasattr(client, 'cache_cas') and not client.cache_cas:
+            raise TypeError('cache_cas is disabled; cas === set, so no locks')
+
         if key.endswith(LOCK_UID_KEY_SUFFIX):
             raise ValueError('Key conflicts with internal lock storage key '
                 '(ends with ' + LOCK_UID_KEY_SUFFIX + ')')
         self.memcache = client
         # Compute hash once only. Also used to keep lock uid close to the
         # value it manages.
+        self.timeout = timeout
         key_hash = hash(key)
         self.key = (key_hash, key)
         uid_key = (key_hash, key + LOCK_UID_KEY_SUFFIX)
@@ -79,11 +85,12 @@ class RLock(object):
         self.interval = interval
 
     def __repr__(self):
-        return '<%s(key=%r, interval=%r, uid=%r) at 0x%x>' % (
+        return '<%s(key=%r, interval=%r, uid=%r, timeout=%s) at 0x%x>' % (
             self.__class__.__name__,
             self.key[1],
             self.interval,
             self.uid,
+            self.timeout,
             id(self),
         )
 
@@ -115,7 +122,7 @@ class RLock(object):
     def release(self):
         owner, count = self.__get()
         if owner != self.uid:
-            raise thread.error('release unlocked lock')
+            raise thread.error('release lock not owned by me')
         assert count > 0
         self.__set(count - 1)
 
@@ -158,7 +165,9 @@ class RLock(object):
         return value
 
     def __set(self, count):
-        if not self.memcache.cas(self.key, (count and self.uid or None, count)):
+        if not self.memcache.cas(
+            self.key, (count and self.uid or None, count), self.timeout
+        ):
             raise MemcacheLockError('Lock stolen')
 
 class Lock(RLock):
@@ -219,82 +228,3 @@ class ThreadRLock(object):
 MemcacheLock = Lock
 MemcacheRLock = RLock
 ThreadMemcacheRLock = ThreadRLock
-
-if __name__ == '__main__':
-    # Run simple tests.
-    # Only verifies the API, no race test is done.
-    import memcache
-    HOSTS = ['127.0.0.1:11211']
-    TEST_KEY_1 = 'foo'
-    TEST_KEY_2 = 'bar'
-    mc1 = memcache.Client(HOSTS)
-    mc2 = memcache.Client(HOSTS)
-    mc3 = memcache.Client(HOSTS)
-    mc1.delete_multi((TEST_KEY_1, TEST_KEY_2, TEST_KEY_1 + LOCK_UID_KEY_SUFFIX,
-        TEST_KEY_2 + LOCK_UID_KEY_SUFFIX))
-
-    for klass in (Lock, RLock, ThreadRLock):
-        # Two locks sharing the same key, a third for crosstalk checking.
-        locka1 = klass(mc1, TEST_KEY_1)
-        locka2 = klass(mc2, TEST_KEY_1)
-        lockb1 = klass(mc3, TEST_KEY_2)
-        print klass, locka1.uid, locka2.uid, lockb1.uid
-
-        def checkLocked(a1=False, a2=False, b1=False):
-            assert locka1.locked() == a1
-            assert locka2.locked() == a2
-            assert lockb1.locked() == b1
-
-        checkLocked()
-        assert locka1.acquire(False)
-        checkLocked(a1=True, a2=True)
-        if klass is Lock:
-            assert not locka1.acquire(False)
-        assert not locka2.acquire(False)
-        checkLocked(a1=True, a2=True)
-        try:
-            locka2.release()
-        except thread.error:
-            pass
-        else:
-            raise AssertionError('Should have raised')
-        checkLocked(a1=True, a2=True)
-        assert locka2.getOwnerUid() == locka1.uid
-        locka1.release()
-        checkLocked()
-        assert locka1.acquire()
-        del locka1
-        # Lock still held, although owner instance died
-        assert locka2.locked()
-        del locka2
-        del lockb1
-        mc1.delete_multi((TEST_KEY_1, TEST_KEY_2))
-
-    # I just need a mutable object. Event happens to have the API I need.
-    success = threading.Event()
-    def release(lock):
-        if lock.acquire(False):
-            success.set()
-    for klass in (RLock, ThreadRLock):
-        # Basic RLock-ish behaviour
-        lock = klass(mc1, TEST_KEY_1)
-        assert lock.acquire(False)
-        assert lock.acquire(False)
-        lock.release()
-        assert lock.locked()
-        lock.release()
-        assert not lock.locked()
-        # RLock-ish behaviour with threads
-        lock.acquire()
-        release_thread = threading.Thread(target=release, args=(lock, ))
-        release_thread.daemon = True
-        release_thread.start()
-        release_thread.join(1)
-        assert not release_thread.is_alive()
-        assert (klass is ThreadRLock) ^ success.is_set(), (klass,
-            success.is_set())
-        success.clear()
-        mc1.delete(TEST_KEY_1)
-
-    print 'Passed.'
-
